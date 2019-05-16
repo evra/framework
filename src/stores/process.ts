@@ -122,7 +122,10 @@ interface ProcessCallbackDecorator {
  * CreateProcess factory interface
  */
 export interface CreateProcess<T = any, P extends object = DefaultPayload> {
-	(id: string, commands: (Command<T, P>[] | Command<T, P>)[], callback?: ProcessCallback<T>): Process<T, P>;
+	(id: string, commands: (Command<T, P>[] | Command<T, P>)[] | ProcessRunner, callback?: ProcessCallback<T>): Process<
+		T,
+		P
+	>;
 }
 
 /**
@@ -143,9 +146,15 @@ export function getProcess(id: string) {
 	return processMap.get(id);
 }
 
+export type ProcessRunnerResult = { undoOperations: PatchOperation[]; error: ProcessError | null };
+export type ProcessRunner<T = any, P extends object = DefaultPayload> = (
+	store: Store<T>,
+	payload: P
+) => Promise<ProcessRunnerResult>;
+
 export function processExecutor<T = any, P extends object = DefaultPayload>(
 	id: string,
-	commands: Commands<T, P>,
+	runner: Commands<T, P> | ProcessRunner<T, P>,
 	store: Store<T>,
 	before: ProcessCallbackBefore | undefined,
 	after: ProcessCallbackAfter | undefined,
@@ -161,11 +170,6 @@ export function processExecutor<T = any, P extends object = DefaultPayload>(
 	}
 
 	return async (executorPayload: P): Promise<ProcessResult<T, P>> => {
-		const operations: PatchOperation[] = [];
-		const commandsCopy = [...commands];
-		let undoOperations: PatchOperation[] = [];
-		let command = commandsCopy.shift();
-		let error: ProcessError | null = null;
 		const payload = transformer ? transformer(executorPayload) : executorPayload;
 
 		if (before) {
@@ -174,32 +178,48 @@ export function processExecutor<T = any, P extends object = DefaultPayload>(
 				await result;
 			}
 		}
-		try {
-			while (command) {
-				let results = [];
-				if (Array.isArray(command)) {
-					results = command.map((commandFunction) => commandFunction({ at, get, path, payload }));
-					results = await Promise.all(results);
-				} else {
-					let result = command({ at, get, path, payload });
-					if (isThenable(result)) {
-						result = await result;
+
+		const operations: PatchOperation[] = [];
+		let error: ProcessError | null = null;
+		let undoOperations: PatchOperation[] = [];
+
+		if (Array.isArray(runner)) {
+			const commandsCopy = [...runner];
+			let command = commandsCopy.shift();
+
+			try {
+				while (command) {
+					let results = [];
+					if (Array.isArray(command)) {
+						results = command.map((commandFunction) => commandFunction({ at, get, path, payload }));
+						results = await Promise.all(results);
+					} else {
+						let result = command({ at, get, path, payload });
+						if (isThenable(result)) {
+							result = await result;
+						}
+						results = [result];
 					}
-					results = [result];
-				}
 
-				for (let i = 0; i < results.length; i++) {
-					operations.push(...results[i]);
-					undoOperations = [...apply(results[i]), ...undoOperations];
-				}
+					for (let i = 0; i < results.length; i++) {
+						operations.push(...results[i]);
+						undoOperations = [...apply(results[i]), ...undoOperations];
+					}
 
-				store.invalidate();
-				command = commandsCopy.shift();
+					store.invalidate();
+					command = commandsCopy.shift();
+				}
+			} catch (e) {
+				error = { error: e, command };
 			}
-		} catch (e) {
-			error = { error: e, command };
+		} else {
+			try {
+				const result = await runner(store, payload);
+				undoOperations = result.undoOperations;
+			} catch (e) {
+				error = { error: e };
+			}
 		}
-
 		after &&
 			after(error, {
 				undoOperations,
@@ -236,7 +256,7 @@ export function processExecutor<T = any, P extends object = DefaultPayload>(
  */
 export function createProcess<T = any, P extends object = DefaultPayload>(
 	id: string,
-	commands: Commands<T, P>,
+	commands: Commands<T, P> | ProcessRunner<T, P>,
 	callbacks?: ProcessCallback | ProcessCallback[]
 ): Process<T, P> {
 	callbacks = Array.isArray(callbacks) ? callbacks : callbacks ? [callbacks] : [];
